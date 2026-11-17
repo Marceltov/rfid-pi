@@ -31,9 +31,30 @@ ansible-playbook playbook.yml
 It enables SPI, drives the reader's reset pin high from boot, installs
 `python3-spidev` and `/usr/local/bin/rfid`, reboots if the boot config
 changed, and fails unless the reader answers over SPI, which tests the wiring
-without a chip. Running it again changes nothing.
+without a chip. It then starts the web page and fails unless that answers too.
+Running it again changes nothing.
 
-## Reading and writing
+## The web page
+
+Open **http://192.168.178.59/** (the Pi's address) in a browser on the home
+network. **Read** shows what is on the chip on the reader; **Write** writes a
+text, a link or raw bytes to it, then reads it back to compare. After a write
+the next chip can go straight on: press Write again. The page waits up to
+20 seconds for a chip, and is in English or German (the browser's language,
+or the switch at the top).
+
+It runs as the systemd service `rfid-web` (`rfid serve --port 80`), which the
+playbook installs and checks. There is no login: anyone on the home network
+can read and write chips with it, which is fine for a Pi that is switched on
+only while chips are written. It accepts JSON only, so another website cannot
+write chips through your browser. Not for the internet.
+
+The API behind it: `GET /api/info`, `POST /api/read` (`{"dump": true}`
+optional) and `POST /api/write` (`{"kind": "text"|"url"|"hex", "value": "…"}`),
+both with optional `"key"` (12 hex digits) and `"block"`. Answers are JSON;
+408 means no chip in time, 409 the reader is busy, 422 the chip refused.
+
+## Reading and writing from the shell
 
 On the Pi:
 
@@ -68,4 +89,5 @@ bash tests/rfid.test.sh
 ```
 
 They run without a reader: the checksum against ISO 14443-3's own examples,
-the NDEF encoding, and the write paths against a simulated chip.
+the NDEF encoding, the write paths against a simulated chip, and the web
+page's API and language choice.
