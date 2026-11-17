@@ -36,8 +36,8 @@ Running it again changes nothing.
 
 ## The web page
 
-Open **http://192.168.178.59/** (the Pi's address) in a browser on the home
-network. **Read** shows what is on the chip on the reader; **Write** writes a
+Open **http://<pi-address>/** (the Pi's address, port 80) in a browser on the
+home network. **Read** shows what is on the chip on the reader; **Write** writes a
 text, a link or raw bytes to it, then reads it back to compare. After a write
 the next chip can go straight on: press Write again. The page waits up to
 20 seconds for a chip, and is in English or German (the browser's language,
