@@ -6,6 +6,8 @@ needs nothing beyond Raspberry Pi OS and its `python3-spidev` package. Older
 tutorials use SPI-Py and MFRC522-python, which are Python 2 and do not run on
 current Raspberry Pi OS.
 
+![A Raspberry Pi wired to a blue RC522 reader over a ribbon cable](images/pi-rc522.jpg)
+
 ## Wiring
 
 | RC522 | Raspberry Pi header pin |
@@ -91,3 +93,19 @@ bash tests/rfid.test.sh
 They run without a reader: the checksum against ISO 14443-3's own examples,
 the NDEF encoding, the write paths against a simulated chip, and the web
 page's API and language choice.
+
+## If your tag won't read: check the frequency
+
+The RC522 is a **13.56 MHz** reader. Many door fobs — the cheap blue teardrop
+kind especially — are **125 kHz (EM4100)** instead, and this reader is
+completely silent to them: no error, just nothing. The two bands don't
+interoperate, so no amount of wiring or code will help.
+
+![A blue teardrop RFID key fob](images/em4100-fob.jpg)
+
+*Quick test:* hold the tag to an NFC phone. If the phone reacts, it's
+13.56 MHz and this reader can use it. If nothing happens, it's probably
+125 kHz — and you need a **125 kHz copier** instead, which reads the fob and
+writes a T5577 blank, standalone, no computer:
+
+![A handheld 125 kHz RFID writer with READ and WRITE buttons and blank fobs](images/handheld-copier.jpg)
