@@ -1,0 +1,61 @@
+---
+# Sets up a Raspberry Pi with an RC522 RFID reader so `rfid` can read and
+# write chips. Run: ansible-playbook playbook.yml
+- name: RFID reader on a Raspberry Pi
+  hosts: rfid
+  become: true
+  vars:
+    # The GPIO the RC522's RST pin is wired to (header pin 22). The reader
+    # sleeps while it is low, so the firmware drives it high from boot.
+    rfid_rst_gpio: 25
+  tasks:
+    - name: Check that this is Raspberry Pi OS (Bookworm or Trixie)
+      ansible.builtin.assert:
+        that: ansible_facts.distribution_release in ['bookworm', 'trixie']
+        fail_msg: >-
+          Expected Raspberry Pi OS Bookworm or Trixie, found
+          {{ ansible_facts.distribution_release }}. The boot config lives in
+          /boot/firmware/config.txt only from Bookworm on.
+
+    - name: Install the SPI library for Python
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+        name: python3-spidev
+        state: present
+        install_recommends: false
+
+    # Appended after the file's last section header; the block opens [all] so
+    # it applies to every board whatever that header is.
+    - name: Enable SPI and hold the reader's reset pin high
+      ansible.builtin.blockinfile:
+        path: /boot/firmware/config.txt
+        marker: "# {mark} ANSIBLE MANAGED rfid reader"
+        block: |
+          [all]
+          dtparam=spi=on
+          gpio={{ rfid_rst_gpio }}=op,dh
+      register: rfid_boot_config
+
+    - name: Reboot so the boot config takes effect
+      ansible.builtin.reboot:
+        reboot_timeout: 600
+      when: rfid_boot_config is changed
+
+    - name: Install the rfid command
+      ansible.builtin.copy:
+        src: files/rfid
+        dest: /usr/local/bin/rfid
+        mode: "0755"
+
+    # Reads the reader's version register over SPI: fails on a miswired or
+    # unpowered reader, and needs no chip.
+    - name: Check that the reader answers
+      ansible.builtin.command: /usr/local/bin/rfid info
+      register: rfid_info
+      changed_when: false
+      check_mode: false
+
+    - name: Show the reader
+      ansible.builtin.debug:
+        msg: "{{ rfid_info.stdout }}"

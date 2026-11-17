@@ -1,0 +1,555 @@
+#!/usr/bin/env python3
+"""rfid: read and write RFID chips on an RC522 reader wired to SPI0, CE0.
+
+    rfid info                 does the reader answer? (no chip needed)
+    rfid read                 hold a chip to the reader, print what is on it
+    rfid read --dump          every block or page, in hex
+    rfid write "some text"    write text
+    rfid write --url https://example.org     NTAG/Ultralight only
+    rfid write --hex 00112233                raw bytes
+
+Two chip families are handled:
+  MIFARE Classic (the white card and blue fob that come with an RC522):
+    text or bytes go into the data blocks from block 8 on, zero-padded.
+    Block 0 (the UID) and the sector trailers (keys) are never written.
+  NTAG21x / MIFARE Ultralight (NFC stickers): text and URLs are written as an
+    NDEF message from page 4 on, which is what a phone reads. The lock and
+    configuration pages are never written.
+
+Every write is read back and compared. Installed by Ansible (roles/rfid_reader);
+it needs python3-spidev and nothing else.
+"""
+import argparse
+import sys
+import time
+
+WIRING = "SDA->pin 24, SCK->23, MOSI->19, MISO->21, RST->22, 3.3V->1, GND->6"
+
+# MFRC522 registers and commands (datasheet chapter 9).
+COMMAND, COM_IRQ, ERROR, STATUS2, FIFO_DATA, FIFO_LEVEL = 0x01, 0x04, 0x06, 0x08, 0x09, 0x0A
+CONTROL, BIT_FRAMING, COLL = 0x0C, 0x0D, 0x0E
+MODE, TX_MODE, RX_MODE, TX_CONTROL, TX_ASK = 0x11, 0x12, 0x13, 0x14, 0x15
+MOD_WIDTH, RF_CFG, T_MODE, T_PRESCALER, T_RELOAD_H, T_RELOAD_L, VERSION = 0x24, 0x26, 0x2A, 0x2B, 0x2C, 0x2D, 0x37
+CMD_IDLE, CMD_TRANSCEIVE, CMD_MF_AUTHENT, CMD_SOFT_RESET = 0x00, 0x0C, 0x0E, 0x0F
+
+READER_VERSIONS = {
+    0x91: "MFRC522 v1.0", 0x92: "MFRC522 v2.0", 0x88: "FM17522 (clone)",
+    0xB2: "MFRC522 clone", 0x12: "counterfeit MFRC522",
+}
+DEFAULT_KEY = "FFFFFFFFFFFF"
+
+
+class RfidError(Exception):
+    pass
+
+
+class NoAnswer(RfidError):
+    """The chip did not answer in time (or there is none)."""
+
+
+def crc_a(data):
+    """ISO 14443-3 type A checksum, low byte first."""
+    crc = 0x6363
+    for b in data:
+        b ^= crc & 0xFF
+        b ^= (b << 4) & 0xFF
+        crc = (crc >> 8) ^ (b << 8) ^ (b << 3) ^ (b >> 4)
+    return [crc & 0xFF, (crc >> 8) & 0xFF]
+
+
+def with_crc(data):
+    return list(data) + crc_a(data)
+
+
+def strip_crc(resp):
+    if len(resp) < 3 or crc_a(resp[:-2]) != list(resp[-2:]):
+        raise RfidError("the chip's answer was garbled (checksum); hold it still and closer")
+    return list(resp[:-2])
+
+
+# --- MIFARE Classic layout ---------------------------------------------------
+
+CLASSIC_BLOCKS = {0x09: 20, 0x08: 64, 0x88: 64, 0x18: 256}   # by SAK
+
+
+def is_trailer(block):
+    return block % 4 == 3 if block < 128 else block % 16 == 15
+
+
+def sector_start(block):
+    return block - block % 4 if block < 128 else block - block % 16
+
+
+def classic_data_blocks(start, total):
+    """The writable blocks from `start` on: no block 0, no sector trailer."""
+    return [b for b in range(start, total) if b != 0 and not is_trailer(b)]
+
+
+# --- NDEF (what a phone reads from an NTAG) ----------------------------------
+
+URI_PREFIXES = [
+    "", "http://www.", "https://www.", "http://", "https://", "tel:", "mailto:",
+    "ftp://anonymous:anonymous@", "ftp://ftp.", "ftps://", "sftp://", "smb://",
+    "nfs://", "ftp://", "dav://", "news:", "telnet://", "imap:", "rtsp://",
+    "urn:", "pop:", "sip:", "sips:", "tftp:", "btspp://", "btl2cap://",
+    "btgoep://", "tcpobex://", "irdaobex://", "file://", "urn:epc:id:",
+    "urn:epc:tag:", "urn:epc:pat:", "urn:epc:raw:", "urn:epc:", "urn:nfc:",
+]
+
+
+def ndef_record(rtype, payload):
+    if len(payload) < 256:
+        return bytes([0xD1, len(rtype), len(payload)]) + rtype + payload
+    return bytes([0xC1, len(rtype)]) + len(payload).to_bytes(4, "big") + rtype + payload
+
+
+def ndef_uri(url):
+    code = max((i for i, p in enumerate(URI_PREFIXES) if p and url.startswith(p)),
+               key=lambda i: len(URI_PREFIXES[i]), default=0)
+    return ndef_record(b"U", bytes([code]) + url[len(URI_PREFIXES[code]):].encode())
+
+
+def ndef_text(text, lang="en"):
+    return ndef_record(b"T", bytes([len(lang)]) + lang.encode() + text.encode())
+
+
+def ndef_tlv(message):
+    length = bytes([len(message)]) if len(message) < 255 else b"\xff" + len(message).to_bytes(2, "big")
+    return b"\x03" + length + message + b"\xfe"
+
+
+def ndef_parse(data):
+    """(kind, value) of the first record in the chip's user memory, or None."""
+    data = bytes(data)
+    i = 0
+    while i < len(data):
+        tag = data[i]
+        i += 1
+        if tag == 0x00:
+            continue
+        if tag == 0xFE or i >= len(data):
+            return None
+        length = data[i]
+        i += 1
+        if length == 0xFF:
+            if i + 2 > len(data):
+                return None
+            length = int.from_bytes(data[i:i + 2], "big")
+            i += 2
+        if tag == 0x03:
+            return _ndef_first_record(data[i:i + length])
+        i += length
+    return None
+
+
+def _ndef_first_record(msg):
+    try:
+        header, tlen = msg[0], msg[1]
+        i = 2
+        if header & 0x10:
+            plen = msg[i]
+            i += 1
+        else:
+            plen = int.from_bytes(msg[i:i + 4], "big")
+            i += 4
+        if header & 0x08:
+            i += 1 + msg[i]
+        rtype = msg[i:i + tlen]
+        payload = msg[i + tlen:i + tlen + plen]
+        if header & 0x07 == 1 and rtype == b"U":
+            prefix = URI_PREFIXES[payload[0]] if payload[0] < len(URI_PREFIXES) else ""
+            return "url", prefix + payload[1:].decode(errors="replace")
+        if header & 0x07 == 1 and rtype == b"T":
+            return "text", payload[1 + (payload[0] & 0x3F):].decode(errors="replace")
+        return "ndef", "record of type %r, %d bytes" % (rtype.decode(errors="replace"), len(payload))
+    except IndexError:
+        return None
+
+
+# --- The reader ---------------------------------------------------------------
+
+class Reader:
+    def __init__(self, bus=0, device=0):
+        import spidev   # here, so the pure functions above load without it
+        try:
+            self.spi = spidev.SpiDev()
+            self.spi.open(bus, device)
+        except OSError as e:
+            raise RfidError("cannot open /dev/spidev%d.%d (%s): is SPI enabled?" % (bus, device, e))
+        self.spi.max_speed_hz = 1000000
+        self.spi.mode = 0
+
+    def rd(self, reg):
+        return self.spi.xfer2([((reg << 1) & 0x7E) | 0x80, 0])[1]
+
+    def wr(self, reg, value):
+        self.spi.xfer2([(reg << 1) & 0x7E, value])
+
+    def version(self):
+        v = self.rd(VERSION)
+        if v in (0x00, 0xFF):
+            raise RfidError("no reader answers on SPI0 CE0 (version register reads 0x%02X). "
+                            "Check the wiring: %s" % (v, WIRING))
+        return v
+
+    def init(self):
+        self.version()
+        self.wr(COMMAND, CMD_SOFT_RESET)
+        time.sleep(0.05)
+        self.wr(TX_MODE, 0x00)        # 106 kBd, checksums done here in software
+        self.wr(RX_MODE, 0x00)
+        self.wr(MOD_WIDTH, 0x26)
+        self.wr(T_MODE, 0x80)         # timer starts after each transmission ...
+        self.wr(T_PRESCALER, 0xA9)    # ... ticks every 25 us ...
+        self.wr(T_RELOAD_H, 0x03)     # ... and gives up after 25 ms
+        self.wr(T_RELOAD_L, 0xE8)
+        self.wr(TX_ASK, 0x40)
+        self.wr(MODE, 0x3D)
+        self.wr(RF_CFG, 0x70)         # highest receiver gain: cheap boards need it
+        self.wr(TX_CONTROL, self.rd(TX_CONTROL) | 0x03)   # antenna on
+
+    def _run(self, command, data, tx_last_bits=0):
+        """Send `data`, return (answer bytes, valid bits in the last byte)."""
+        done = 0x10 if command == CMD_MF_AUTHENT else 0x30
+        self.wr(COMMAND, CMD_IDLE)
+        self.wr(COM_IRQ, 0x7F)
+        self.wr(FIFO_LEVEL, 0x80)
+        self.spi.xfer2([(FIFO_DATA << 1) & 0x7E] + list(data))
+        self.wr(BIT_FRAMING, tx_last_bits)
+        self.wr(COMMAND, command)
+        if command == CMD_TRANSCEIVE:
+            self.wr(BIT_FRAMING, 0x80 | tx_last_bits)
+        deadline = time.monotonic() + 0.2
+        try:
+            while True:
+                irq = self.rd(COM_IRQ)
+                if irq & done:
+                    break
+                if irq & 0x01 or time.monotonic() > deadline:
+                    raise NoAnswer("the chip did not answer")
+        finally:
+            self.wr(BIT_FRAMING, 0x00)
+        error = self.rd(ERROR)
+        if error & 0x08:
+            raise RfidError("two answers collided: is more than one chip on the reader?")
+        if error & 0x13:
+            raise RfidError("the chip's answer was garbled (error 0x%02X); hold it still and closer" % error)
+        answer = [self.rd(FIFO_DATA) for _ in range(self.rd(FIFO_LEVEL))]
+        return answer, self.rd(CONTROL) & 0x07
+
+    def transceive(self, data, tx_last_bits=0):
+        return self._run(CMD_TRANSCEIVE, data, tx_last_bits)
+
+    def select(self):
+        """Wake and select the chip in the field: (uid, sak), or None."""
+        self.wr(STATUS2, self.rd(STATUS2) & ~0x08 & 0xFF)   # encryption off
+        self.wr(COLL, self.rd(COLL) & 0x7F)
+        try:
+            self.transceive([0x52], tx_last_bits=7)          # WUPA
+        except NoAnswer:
+            return None
+        uid = []
+        for level in (0x93, 0x95, 0x97):
+            part, _ = self.transceive([level, 0x20])
+            if len(part) != 5 or part[0] ^ part[1] ^ part[2] ^ part[3] != part[4]:
+                raise RfidError("the chip's UID was garbled; hold it still and closer")
+            sak = strip_crc(self.transceive(with_crc([level, 0x70] + part))[0])[0]
+            if sak & 0x04:
+                uid += part[1:4]
+            else:
+                return uid + part[:4], sak
+        raise RfidError("the chip's UID is longer than 10 bytes")
+
+    def must_select(self):
+        chip = self.select()
+        if chip is None:
+            raise RfidError("the chip left the reader")
+        return chip
+
+    def expect_ack(self, data):
+        answer, bits = self.transceive(data)
+        if not (len(answer) == 1 and bits == 4 and answer[0] & 0x0F == 0x0A):
+            raise RfidError("the chip refused (answer %s)" % bytes(answer).hex())
+
+    def read16(self, address):
+        """MIFARE READ: one Classic block, or four Ultralight pages."""
+        data = strip_crc(self.transceive(with_crc([0x30, address]))[0])
+        if len(data) != 16:
+            raise RfidError("the chip refused to be read at %d" % address)
+        return data
+
+    def classic_auth(self, block, key, uid):
+        try:
+            self._run(CMD_MF_AUTHENT, [0x60, block] + list(key) + list(uid[-4:]))
+        except NoAnswer:
+            return False
+        return bool(self.rd(STATUS2) & 0x08)
+
+    def classic_write(self, block, data):
+        self.expect_ack(with_crc([0xA0, block]))
+        self.expect_ack(with_crc(data))
+
+    def ultralight_write(self, page, data):
+        self.expect_ack(with_crc([0xA2, page] + list(data)))
+
+    def ultralight_version(self):
+        """GET_VERSION's 8 bytes, or None (a plain Ultralight has no such command)."""
+        try:
+            return strip_crc(self.transceive(with_crc([0x60]))[0])
+        except RfidError:
+            self.must_select()    # an unknown command sends the chip back to idle
+            return None
+
+    def close(self):
+        try:
+            self.wr(STATUS2, self.rd(STATUS2) & ~0x08 & 0xFF)
+            self.wr(TX_CONTROL, self.rd(TX_CONTROL) & ~0x03 & 0xFF)   # antenna off
+        finally:
+            self.spi.close()
+
+
+# --- Chips --------------------------------------------------------------------
+
+class Classic:
+    def __init__(self, reader, uid, sak, key):
+        self.reader, self.uid, self.key = reader, uid, key
+        self.total = CLASSIC_BLOCKS[sak]
+        self.name = "MIFARE Classic, %d blocks of 16 bytes" % self.total
+        self.sector = None
+
+    def _enter(self, block):
+        """Authenticate for the block's sector; False if the key does not fit."""
+        if self.sector == sector_start(block):
+            return True
+        if self.reader.classic_auth(block, self.key, self.uid):
+            self.sector = sector_start(block)
+            return True
+        self.sector = None
+        self.reader.must_select()   # a refused key leaves the chip silent
+        return False
+
+    def read_block(self, block):
+        if not self._enter(block):
+            return None
+        return self.reader.read16(block)
+
+    def write(self, start, data):
+        if start == 0 or start >= self.total or is_trailer(start):
+            raise RfidError("block %d is not a data block (block 0 and the sector trailers are off limits)" % start)
+        data = list(data) + [0] * (-len(data) % 16)
+        blocks = classic_data_blocks(start, self.total)[:len(data) // 16]
+        if len(blocks) < len(data) // 16:
+            raise RfidError("%d bytes do not fit: %d bytes are free from block %d on"
+                            % (len(data), 16 * len(classic_data_blocks(start, self.total)), start))
+        for n, block in enumerate(blocks):
+            chunk = data[16 * n:16 * n + 16]
+            if not self._enter(block):
+                raise RfidError("the key does not open block %d (pass the sector's key A with --key)" % block)
+            self.reader.classic_write(block, chunk)
+            if self.reader.read16(block) != chunk:
+                raise RfidError("block %d reads back differently after writing" % block)
+        return "blocks %d-%d" % (blocks[0], blocks[-1])
+
+    def read_text(self, start):
+        """Data from `start` up to the first zero byte."""
+        data = []
+        for block in classic_data_blocks(start, self.total):
+            chunk = self.read_block(block)
+            if chunk is None:
+                if not data:
+                    raise RfidError("the key does not open block %d (pass the sector's key A with --key)" % block)
+                break
+            data += chunk
+            if 0 in chunk:
+                break
+        return bytes(data).split(b"\0")[0]
+
+    def dump(self):
+        for block in range(self.total):
+            chunk = self.read_block(block)
+            note = "  UID" if block == 0 else "  trailer (keys)" if is_trailer(block) else ""
+            yield "block %3d  %s%s" % (block, bytes(chunk).hex(" ") if chunk else "locked (another key)", note)
+
+
+class Ultralight:
+    FIRST = 4
+    # GET_VERSION's storage byte -> (name, last user page)
+    SIZES = {0x0B: ("MIFARE Ultralight EV1", 15), 0x0E: ("MIFARE Ultralight EV1", 35),
+             0x0F: ("NTAG213", 39), 0x11: ("NTAG215", 129), 0x13: ("NTAG216", 225)}
+
+    def __init__(self, reader):
+        self.reader = reader
+        version = reader.ultralight_version()
+        kind, self.last = self.SIZES.get(version[6], ("NTAG/Ultralight", 15)) if version else ("MIFARE Ultralight", 15)
+        self.name = "%s, %d bytes" % (kind, 4 * (self.last - self.FIRST + 1))
+
+    def read_pages(self, first, last):
+        data = []
+        for page in range(first, last + 1, 4):
+            data += self.reader.read16(page)
+        return data[:4 * (last - first + 1)]
+
+    def write(self, start, data):
+        if start < self.FIRST or start > self.last:
+            raise RfidError("page %d is not a user page (%d-%d)" % (start, self.FIRST, self.last))
+        data = list(data) + [0] * (-len(data) % 4)
+        pages = len(data) // 4
+        if start + pages - 1 > self.last:
+            raise RfidError("%d bytes do not fit: %d bytes are free from page %d on"
+                            % (len(data), 4 * (self.last - start + 1), start))
+        for n in range(pages):
+            self.reader.ultralight_write(start + n, data[4 * n:4 * n + 4])
+        if self.read_pages(start, start + pages - 1) != data:
+            raise RfidError("pages %d-%d read back differently after writing" % (start, start + pages - 1))
+        return "pages %d-%d" % (start, start + pages - 1)
+
+    def formatted_for_phones(self):
+        return self.reader.read16(3)[0] == 0xE1
+
+    def user_memory(self):
+        return self.read_pages(self.FIRST, self.last)
+
+    def dump(self):
+        data = self.read_pages(0, self.last)
+        for page in range(self.last + 1):
+            yield "page %3d  %s" % (page, bytes(data[4 * page:4 * page + 4]).hex(" "))
+
+
+def open_chip(reader, uid, sak, key):
+    if sak in CLASSIC_BLOCKS:
+        return Classic(reader, uid, sak, key)
+    if sak == 0x00:
+        return Ultralight(reader)
+    raise RfidError("this chip type is not supported (SAK 0x%02X): only MIFARE Classic "
+                    "and NTAG/Ultralight are" % sak)
+
+
+def wait_for_chip(reader, timeout):
+    print("Hold a chip to the reader ...", file=sys.stderr)
+    deadline = time.monotonic() + timeout
+    while True:
+        chip = reader.select()
+        if chip:
+            return chip
+        if time.monotonic() > deadline:
+            raise NoAnswer("no chip within %g seconds" % timeout)
+        time.sleep(0.1)
+
+
+# --- Commands -----------------------------------------------------------------
+
+def cmd_info(reader, args):
+    v = reader.version()
+    print("reader  %s (version register 0x%02X)" % (READER_VERSIONS.get(v, "unknown chip"), v))
+
+
+def cmd_read(reader, args):
+    reader.init()
+    uid, sak = wait_for_chip(reader, args.timeout)
+    chip = open_chip(reader, uid, sak, args.key)
+    print("uid     %s" % bytes(uid).hex(":").upper())
+    print("chip    %s" % chip.name)
+    if args.dump:
+        for line in chip.dump():
+            print(line)
+        return
+    if isinstance(chip, Classic):
+        start = 8 if args.block is None else args.block
+        text = chip.read_text(start)
+        print("text    %s   (from block %d)" % (text.decode(errors="replace"), start) if text
+              else "empty   (block %d starts with a zero byte; --dump shows everything)" % start)
+        return
+    memory = chip.user_memory()
+    found = ndef_parse(memory)
+    if found:
+        print("%-7s %s" % found)
+    else:
+        raw = bytes(memory).split(b"\0")[0]
+        print("raw     %s" % raw.decode(errors="replace") if raw
+              else "empty   (no NDEF message; --dump shows everything)")
+
+
+def cmd_write(reader, args):
+    if sum(x is not None for x in (args.text, args.url, args.hex)) != 1:
+        raise RfidError("give exactly one of: a text, --url or --hex")
+    reader.init()
+    uid, sak = wait_for_chip(reader, args.timeout)
+    chip = open_chip(reader, uid, sak, args.key)
+    print("uid     %s" % bytes(uid).hex(":").upper())
+    print("chip    %s" % chip.name)
+    if isinstance(chip, Classic):
+        if args.url is not None:
+            raise RfidError("a URL needs an NTAG/Ultralight chip: a phone does not read one from a MIFARE Classic")
+        data = bytes.fromhex(args.hex) if args.hex is not None else args.text.encode()
+        where = chip.write(8 if args.block is None else args.block, data)
+    else:
+        if args.hex is not None:
+            data = bytes.fromhex(args.hex)
+        else:
+            if args.block is not None:
+                raise RfidError("--block goes with --hex here: text and URLs start at page 4, where a phone looks")
+            data = ndef_tlv(ndef_uri(args.url) if args.url is not None else ndef_text(args.text))
+            if not chip.formatted_for_phones():
+                print("note    this chip is not NFC-formatted (page 3); a phone may not read it", file=sys.stderr)
+        where = chip.write(Ultralight.FIRST if args.block is None else args.block, data)
+    print("written %d bytes to %s, read back and compared" % (len(data), where))
+
+
+def hex_key(value):
+    try:
+        key = bytes.fromhex(value)
+    except ValueError:
+        key = b""
+    if len(key) != 6:
+        raise argparse.ArgumentTypeError("a key is 12 hex digits")
+    return list(key)
+
+
+def hex_bytes(value):
+    try:
+        bytes.fromhex(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("not hex: %s" % value)
+    return value
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(prog="rfid", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="command", required=True)
+    sub.add_parser("info", help="does the reader answer?").set_defaults(func=cmd_info)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--timeout", type=float, default=30, help="seconds to wait for a chip (default 30)")
+    common.add_argument("--key", type=hex_key, default=hex_key(DEFAULT_KEY),
+                        help="MIFARE Classic key A, 12 hex digits (default %s, the factory key)" % DEFAULT_KEY)
+    common.add_argument("--block", type=int, help="Classic block to start at (default 8); with --hex also an NTAG page (default 4)")
+    r = sub.add_parser("read", parents=[common], help="print what is on a chip")
+    r.add_argument("--dump", action="store_true", help="every block or page, in hex")
+    r.set_defaults(func=cmd_read)
+    w = sub.add_parser("write", parents=[common], help="write a text, a URL or raw bytes")
+    w.add_argument("text", nargs="?", help="text to write")
+    w.add_argument("--url", help="a URL (NTAG/Ultralight only)")
+    w.add_argument("--hex", type=hex_bytes, help="raw bytes, as hex")
+    w.set_defaults(func=cmd_write)
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    reader = None
+    try:
+        reader = Reader()
+        args.func(reader, args)
+    except NoAnswer as e:
+        print("rfid: %s" % e, file=sys.stderr)
+        return 2
+    except RfidError as e:
+        print("rfid: %s" % e, file=sys.stderr)
+        return 1
+    finally:
+        if reader is not None:
+            reader.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
