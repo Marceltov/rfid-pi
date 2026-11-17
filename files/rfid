@@ -7,6 +7,7 @@
     rfid write "some text"    write text
     rfid write --url https://example.org     NTAG/Ultralight only
     rfid write --hex 00112233                raw bytes
+    rfid serve                a web page for all of the above, on port 80
 
 Two chip families are handled:
   MIFARE Classic (the white card and blue fob that come with an RC522):
@@ -20,8 +21,13 @@ Every write is read back and compared. Installed by Ansible (roles/rfid_reader);
 it needs python3-spidev and nothing else.
 """
 import argparse
+import html
+import http.cookies
+import json
 import sys
+import threading
 import time
+import urllib.parse
 
 WIRING = "SDA->pin 24, SCK->23, MOSI->19, MISO->21, RST->22, 3.3V->1, GND->6"
 
@@ -336,7 +342,7 @@ class Classic:
     def write(self, start, data):
         if start == 0 or start >= self.total or is_trailer(start):
             raise RfidError("block %d is not a data block (block 0 and the sector trailers are off limits)" % start)
-        data = list(data) + [0] * (-len(data) % 16)
+        data = (list(data) or [0]) + [0] * (-len(data) % 16 if data else 15)
         blocks = classic_data_blocks(start, self.total)[:len(data) // 16]
         if len(blocks) < len(data) // 16:
             raise RfidError("%d bytes do not fit: %d bytes are free from block %d on"
@@ -392,7 +398,7 @@ class Ultralight:
     def write(self, start, data):
         if start < self.FIRST or start > self.last:
             raise RfidError("page %d is not a user page (%d-%d)" % (start, self.FIRST, self.last))
-        data = list(data) + [0] * (-len(data) % 4)
+        data = (list(data) or [0]) + [0] * (-len(data) % 4 if data else 3)
         pages = len(data) // 4
         if start + pages - 1 > self.last:
             raise RfidError("%d bytes do not fit: %d bytes are free from page %d on"
@@ -424,8 +430,10 @@ def open_chip(reader, uid, sak, key):
                     "and NTAG/Ultralight are" % sak)
 
 
-def wait_for_chip(reader, timeout):
-    print("Hold a chip to the reader ...", file=sys.stderr)
+
+def wait_for_chip(reader, timeout, on_wait=None):
+    if on_wait:
+        on_wait()
     deadline = time.monotonic() + timeout
     while True:
         chip = reader.select()
@@ -436,63 +444,116 @@ def wait_for_chip(reader, timeout):
         time.sleep(0.1)
 
 
-# --- Commands -----------------------------------------------------------------
+# --- Reading and writing, for the command line and the web page ---------------
+
+def reader_info(reader):
+    v = reader.version()
+    return {"reader": READER_VERSIONS.get(v, "unknown chip"), "version": "0x%02X" % v}
+
+
+def chip_on_reader(reader, timeout, key, on_wait):
+    reader.init()
+    uid, sak = wait_for_chip(reader, timeout, on_wait)
+    return bytes(uid).hex(":").upper(), open_chip(reader, uid, sak, key)
+
+
+def read_chip(reader, timeout=30, key=None, block=None, dump=False, on_wait=None):
+    """What is on the chip: uid, chip, and kind (text, url, ndef, raw, empty)
+    with value and where, or dump (a list of lines)."""
+    uid, chip = chip_on_reader(reader, timeout, key or hex_key(DEFAULT_KEY), on_wait)
+    result = {"uid": uid, "chip": chip.name}
+    if dump:
+        result["dump"] = list(chip.dump())
+        return result
+    if isinstance(chip, Classic):
+        start = 8 if block is None else block
+        text = chip.read_text(start)
+        result["where"] = "block %d" % start
+        result.update(kind="text", value=text.decode(errors="replace")) if text else result.update(kind="empty")
+        return result
+    memory = chip.user_memory()
+    result["where"] = "page %d" % Ultralight.FIRST
+    found = ndef_parse(memory)
+    raw = bytes(memory).split(b"\0")[0]
+    if found:
+        result.update(kind=found[0], value=found[1])
+    elif raw:
+        result.update(kind="raw", value=raw.decode(errors="replace"))
+    else:
+        result.update(kind="empty")
+    return result
+
+
+def write_chip(reader, kind, value, timeout=30, key=None, block=None, on_wait=None):
+    """Write a text, a url or hex bytes; every write is read back and compared."""
+    if kind not in ("text", "url", "hex") or not isinstance(value, str):
+        raise RfidError("write a text, a url or hex bytes")
+    if kind == "hex":
+        try:
+            raw = bytes.fromhex(value)
+        except ValueError:
+            raise RfidError("not hex: %s" % value)
+        if not raw:
+            raise RfidError("no bytes to write")
+    if kind == "url" and not value:
+        raise RfidError("no URL to write")
+    uid, chip = chip_on_reader(reader, timeout, key or hex_key(DEFAULT_KEY), on_wait)
+    result = {"uid": uid, "chip": chip.name}
+    if isinstance(chip, Classic):
+        if kind == "url":
+            raise RfidError("a URL needs an NTAG/Ultralight chip: a phone does not read one from a MIFARE Classic")
+        data = raw if kind == "hex" else value.encode()
+        where = chip.write(8 if block is None else block, data)
+    else:
+        if kind == "hex":
+            data = raw
+        else:
+            if block is not None:
+                raise RfidError("a start block goes with hex bytes only here: text and URLs start at page 4, where a phone looks")
+            data = ndef_tlv(ndef_uri(value) if kind == "url" else ndef_text(value))
+            if not chip.formatted_for_phones():
+                result["note"] = "this chip is not NFC-formatted (page 3); a phone may not read it"
+        where = chip.write(Ultralight.FIRST if block is None else block, data)
+    result.update(bytes=len(data), where=where)
+    return result
+
+
+# --- The command line ---------------------------------------------------------
+
+def hold_a_chip():
+    print("Hold a chip to the reader ...", file=sys.stderr)
+
+
+def show(result):
+    for name in ("uid", "chip"):
+        print("%-7s %s" % (name, result[name]))
+
 
 def cmd_info(reader, args):
-    v = reader.version()
-    print("reader  %s (version register 0x%02X)" % (READER_VERSIONS.get(v, "unknown chip"), v))
+    info = reader_info(reader)
+    print("reader  %s (version register %s)" % (info["reader"], info["version"]))
 
 
 def cmd_read(reader, args):
-    reader.init()
-    uid, sak = wait_for_chip(reader, args.timeout)
-    chip = open_chip(reader, uid, sak, args.key)
-    print("uid     %s" % bytes(uid).hex(":").upper())
-    print("chip    %s" % chip.name)
+    result = read_chip(reader, args.timeout, args.key, args.block, args.dump, hold_a_chip)
+    show(result)
     if args.dump:
-        for line in chip.dump():
-            print(line)
-        return
-    if isinstance(chip, Classic):
-        start = 8 if args.block is None else args.block
-        text = chip.read_text(start)
-        print("text    %s   (from block %d)" % (text.decode(errors="replace"), start) if text
-              else "empty   (block %d starts with a zero byte; --dump shows everything)" % start)
-        return
-    memory = chip.user_memory()
-    found = ndef_parse(memory)
-    if found:
-        print("%-7s %s" % found)
+        print("\n".join(result["dump"]))
+    elif result["kind"] == "empty":
+        print("empty   (nothing from %s on; --dump shows everything)" % result["where"])
     else:
-        raw = bytes(memory).split(b"\0")[0]
-        print("raw     %s" % raw.decode(errors="replace") if raw
-              else "empty   (no NDEF message; --dump shows everything)")
+        print("%-7s %s" % (result["kind"], result["value"]))
 
 
 def cmd_write(reader, args):
-    if sum(x is not None for x in (args.text, args.url, args.hex)) != 1:
+    given = [(k, v) for k, v in (("text", args.text), ("url", args.url), ("hex", args.hex)) if v is not None]
+    if len(given) != 1:
         raise RfidError("give exactly one of: a text, --url or --hex")
-    reader.init()
-    uid, sak = wait_for_chip(reader, args.timeout)
-    chip = open_chip(reader, uid, sak, args.key)
-    print("uid     %s" % bytes(uid).hex(":").upper())
-    print("chip    %s" % chip.name)
-    if isinstance(chip, Classic):
-        if args.url is not None:
-            raise RfidError("a URL needs an NTAG/Ultralight chip: a phone does not read one from a MIFARE Classic")
-        data = bytes.fromhex(args.hex) if args.hex is not None else args.text.encode()
-        where = chip.write(8 if args.block is None else args.block, data)
-    else:
-        if args.hex is not None:
-            data = bytes.fromhex(args.hex)
-        else:
-            if args.block is not None:
-                raise RfidError("--block goes with --hex here: text and URLs start at page 4, where a phone looks")
-            data = ndef_tlv(ndef_uri(args.url) if args.url is not None else ndef_text(args.text))
-            if not chip.formatted_for_phones():
-                print("note    this chip is not NFC-formatted (page 3); a phone may not read it", file=sys.stderr)
-        where = chip.write(Ultralight.FIRST if args.block is None else args.block, data)
-    print("written %d bytes to %s, read back and compared" % (len(data), where))
+    result = write_chip(reader, given[0][0], given[0][1], args.timeout, args.key, args.block, hold_a_chip)
+    show(result)
+    if "note" in result:
+        print("note    %s" % result["note"], file=sys.stderr)
+    print("written %d bytes to %s, read back and compared" % (result["bytes"], result["where"]))
 
 
 def hex_key(value):
@@ -530,11 +591,20 @@ def parse_args(argv):
     w.add_argument("--url", help="a URL (NTAG/Ultralight only)")
     w.add_argument("--hex", type=hex_bytes, help="raw bytes, as hex")
     w.set_defaults(func=cmd_write)
+    s = sub.add_parser("serve", help="the web page for reading and writing")
+    s.add_argument("--port", type=int, default=80, help="port to listen on (default 80)")
+    s.add_argument("--timeout", type=float, default=20, help="seconds the page waits for a chip (default 20)")
+    s.set_defaults(func=None)
     return p.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.command == "serve":
+        server = make_server(Reader, args.port, args.timeout)
+        print("rfid: serving on port %d" % server.server_address[1], file=sys.stderr)
+        server.serve_forever()
+        return 0
     reader = None
     try:
         reader = Reader()
@@ -549,6 +619,368 @@ def main(argv=None):
         if reader is not None:
             reader.close()
     return 0
+
+
+# --- The web page ---------------------------------------------------------------
+# One page on GET /, a JSON API under /api/. The reader serves one request at a
+# time; a second one while it waits for a chip gets 409. POSTs must be JSON,
+# which a browser sends cross-site only after a CORS preflight this server never
+# grants: another website cannot write chips through a visitor's browser.
+# Errors from the reader are English, the page's own strings come from COPY.
+
+COPY = {
+    "en": {
+        "lang_name": "English",
+        "title": "RFID reader",
+        "read": "Read",
+        "read_chip": "Read chip",
+        "dump": "Show every block (hex)",
+        "write": "Write",
+        "kind": "What to write",
+        "kind_text": "Text",
+        "kind_url": "Link (NFC stickers only)",
+        "kind_hex": "Bytes (hex)",
+        "value": "Content",
+        "write_chip": "Write chip",
+        "advanced": "MIFARE Classic options",
+        "key": "Key A (12 hex digits)",
+        "block": "Start block (empty: 8; with bytes on an NFC sticker: page 4)",
+        "hold": "Hold a chip to the reader …",
+        "busy": "The reader is busy with another request. Try again in a moment.",
+        "no_chip": "No chip found in time. Hold it flat on the reader and try again.",
+        "failed": "Did not work:",
+        "offline": "The Pi did not answer. Is it on?",
+        "written": "Written and read back: {bytes} bytes to {where}. Put the next chip on and write again.",
+        "uid": "UID",
+        "chip": "Chip",
+        "content": "Content",
+        "empty": "empty",
+        "kinds": {"text": "Text", "url": "Link", "ndef": "NFC record", "raw": "Raw data"},
+        "where": "Where",
+        "note": "Note",
+        "reader": "Reader",
+        "reader_missing": "The reader does not answer:",
+        "language": "Language",
+    },
+    "de": {
+        "lang_name": "Deutsch",
+        "title": "RFID-Leser",
+        "read": "Lesen",
+        "read_chip": "Chip lesen",
+        "dump": "Alle Blöcke zeigen (hex)",
+        "write": "Schreiben",
+        "kind": "Was geschrieben wird",
+        "kind_text": "Text",
+        "kind_url": "Link (nur NFC-Sticker)",
+        "kind_hex": "Bytes (hex)",
+        "value": "Inhalt",
+        "write_chip": "Chip beschreiben",
+        "advanced": "Optionen für MIFARE Classic",
+        "key": "Schlüssel A (12 Hex-Ziffern)",
+        "block": "Startblock (leer: 8; mit Bytes auf einem NFC-Sticker: Seite 4)",
+        "hold": "Chip an den Leser halten …",
+        "busy": "Der Leser ist gerade mit etwas anderem beschäftigt. Gleich noch einmal versuchen.",
+        "no_chip": "Kein Chip gefunden. Flach auf den Leser legen und noch einmal versuchen.",
+        "failed": "Hat nicht geklappt:",
+        "offline": "Der Pi antwortet nicht. Ist er an?",
+        "written": "Geschrieben und gegengelesen: {bytes} Bytes nach {where}. Nächsten Chip auflegen und wieder schreiben.",
+        "uid": "UID",
+        "chip": "Chip",
+        "content": "Inhalt",
+        "empty": "leer",
+        "kinds": {"text": "Text", "url": "Link", "ndef": "NFC-Eintrag", "raw": "Rohdaten"},
+        "where": "Wo",
+        "note": "Hinweis",
+        "reader": "Leser",
+        "reader_missing": "Der Leser antwortet nicht:",
+        "language": "Sprache",
+    },
+}
+
+
+def pick_language(query_lang, cookie, accept):
+    if query_lang in COPY:
+        return query_lang
+    if cookie in COPY:
+        return cookie
+    weighted = []
+    for part in (accept or "").split(","):
+        tag, _, params = part.strip().partition(";")
+        q = 1.0
+        if params.strip().startswith("q="):
+            try:
+                q = float(params.strip()[2:])
+            except ValueError:
+                q = 0
+        weighted.append((q, tag.strip().lower().split("-")[0]))
+    for q, tag in sorted(weighted, key=lambda w: -w[0]):
+        if q > 0 and tag in COPY:
+            return tag
+    return "en"
+
+
+PAGE = """<!doctype html>
+<html lang="__LANG__">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+:root { color-scheme: light dark; --bg: #f6f5f2; --card: #fff; --text: #1d1d1b; --muted: #55534e; --line: #8a877f;
+        --accent: #0057b0; --on-accent: #fff; --ok: #006b3c; --bad: #a3271b; --focus: #b35c00; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #161615; --card: #22211f; --text: #f1efe9; --muted: #bdb9b0; --line: #8e8a82;
+          --accent: #7ab8ff; --on-accent: #0b1a2c; --ok: #6fd6a1; --bad: #ff9a8c; --focus: #ffb35c; } }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.5 system-ui, sans-serif; }
+main { max-width: 40rem; margin: 0 auto; padding: 1rem; }
+header { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; flex-wrap: wrap; }
+h1 { font-size: 1.5rem; margin: .5rem 0; }
+nav a { color: var(--accent); margin-left: .75rem; }
+nav a[aria-current] { color: var(--text); font-weight: 700; text-decoration: none; }
+section { background: var(--card); border: 1px solid var(--line); border-radius: .5rem; padding: 1rem; margin: 1rem 0; }
+h2 { font-size: 1.15rem; margin: 0 0 .75rem; }
+label { display: block; font-weight: 600; margin: .75rem 0 .25rem; }
+label.inline { display: inline-flex; gap: .5rem; align-items: center; font-weight: 400; }
+input[type=text], select, textarea { width: 100%; font: inherit; color: inherit; background: var(--bg);
+  border: 1px solid var(--line); border-radius: .35rem; padding: .5rem; }
+textarea { min-height: 5rem; resize: vertical; }
+button { font: inherit; font-weight: 600; margin-top: 1rem; min-height: 2.75rem; padding: .5rem 1.25rem;
+  border: 2px solid var(--accent); border-radius: .35rem; background: var(--accent); color: var(--on-accent); cursor: pointer; }
+button:disabled { opacity: .6; cursor: progress; }
+:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+details { margin-top: 1rem; }
+summary { cursor: pointer; }
+.status { margin-top: 1rem; min-height: 1.5rem; }
+.status.ok { color: var(--ok); }
+.status.ok::before { content: "✓ "; font-weight: 700; }
+.status.bad { color: var(--bad); }
+.status.bad::before { content: "✗ "; font-weight: 700; }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: .25rem 1rem; margin: 1rem 0 0; }
+dt { color: var(--muted); }
+dd { margin: 0; overflow-wrap: anywhere; }
+pre { overflow-x: auto; font-size: .85rem; margin: 1rem 0 0; }
+.reader { color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+<header>
+  <h1>__TITLE__</h1>
+  <nav aria-label="__LANGUAGE__">__LANGS__</nav>
+</header>
+<p class="reader" id="reader"></p>
+
+<section aria-labelledby="h-read">
+  <h2 id="h-read">__READ__</h2>
+  <form id="read-form">
+    <label class="inline"><input type="checkbox" id="dump"> __DUMP__</label><br>
+    <button type="submit">__READ_CHIP__</button>
+  </form>
+  <p class="status" id="read-status" role="status" aria-live="polite"></p>
+  <div id="read-result"></div>
+</section>
+
+<section aria-labelledby="h-write">
+  <h2 id="h-write">__WRITE__</h2>
+  <form id="write-form">
+    <label for="kind">__KIND__</label>
+    <select id="kind">
+      <option value="text">__KIND_TEXT__</option>
+      <option value="url">__KIND_URL__</option>
+      <option value="hex">__KIND_HEX__</option>
+    </select>
+    <label for="value">__VALUE__</label>
+    <textarea id="value" spellcheck="false"></textarea>
+    <details>
+      <summary>__ADVANCED__</summary>
+      <label for="key">__KEY__</label>
+      <input type="text" id="key" value="FFFFFFFFFFFF" autocomplete="off" spellcheck="false">
+      <label for="block">__BLOCK__</label>
+      <input type="text" id="block" inputmode="numeric" autocomplete="off">
+    </details>
+    <button type="submit">__WRITE_CHIP__</button>
+  </form>
+  <p class="status" id="write-status" role="status" aria-live="polite"></p>
+</section>
+</main>
+<script>
+const T = __COPY__;
+const $ = (id) => document.getElementById(id);
+
+async function call(path, body) {
+  let response;
+  try {
+    response = await fetch(path, body === undefined ? {} :
+      {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+  } catch (e) {
+    return {error: T.offline};
+  }
+  const data = await response.json().catch(() => ({error: response.statusText}));
+  if (response.status === 409) return {error: T.busy};
+  if (response.status === 408) return {error: T.no_chip};
+  if (!response.ok) return {error: T.failed + " " + (data.error || response.status)};
+  return data;
+}
+
+function say(el, text, kind) {
+  el.textContent = text;
+  el.className = "status" + (kind ? " " + kind : "");
+}
+
+function options() {
+  const opts = {key: $("key").value.trim()};
+  const block = $("block").value.trim();
+  if (block !== "") opts.block = Number(block);
+  return opts;
+}
+
+function busy(form, on) {
+  form.querySelector("button").disabled = on;
+  form.setAttribute("aria-busy", on ? "true" : "false");
+}
+
+function row(dl, label, value) {
+  const dt = document.createElement("dt"); dt.textContent = label;
+  const dd = document.createElement("dd"); dd.textContent = value;
+  dl.append(dt, dd);
+}
+
+$("read-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.target, out = $("read-result"), status = $("read-status");
+  busy(form, true); out.replaceChildren(); say(status, T.hold);
+  const r = await call("/api/read", {dump: $("dump").checked, ...options()});
+  busy(form, false);
+  if (r.error) { say(status, r.error, "bad"); return; }
+  say(status, "");
+  const dl = document.createElement("dl");
+  row(dl, T.uid, r.uid);
+  row(dl, T.chip, r.chip);
+  if (!r.dump) {
+    row(dl, T.content, r.kind === "empty" ? "(" + T.empty + ")" : T.kinds[r.kind] + ": " + r.value);
+    row(dl, T.where, r.where);
+  }
+  out.append(dl);
+  if (r.dump) {
+    const pre = document.createElement("pre"); pre.textContent = r.dump.join("\\n"); out.append(pre);
+  }
+});
+
+$("write-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.target, status = $("write-status");
+  busy(form, true); say(status, T.hold);
+  const r = await call("/api/write", {kind: $("kind").value, value: $("value").value, ...options()});
+  busy(form, false);
+  if (r.error) { say(status, r.error, "bad"); return; }
+  let text = T.written.replace("{bytes}", r.bytes).replace("{where}", r.where) + " (" + T.uid + " " + r.uid + ")";
+  if (r.note) text += " " + T.note + ": " + r.note;
+  say(status, text, "ok");
+});
+
+call("/api/info").then((r) => {
+  $("reader").textContent = r.error ? T.reader_missing + " " + r.error : T.reader + ": " + r.reader;
+});
+</script>
+</body>
+</html>
+"""
+
+
+def render_page(lang):
+    t = COPY[lang]
+    langs = " ".join(
+        '<a href="/?lang=%s" lang="%s" hreflang="%s"%s>%s</a>'
+        % (code, code, code, ' aria-current="true"' if code == lang else "", html.escape(c["lang_name"]))
+        for code, c in COPY.items())
+    page = PAGE.replace("__LANG__", lang).replace("__LANGS__", langs)
+    page = page.replace("__COPY__", json.dumps(t, ensure_ascii=False).replace("</", "<\\/"))
+    for name, text in t.items():
+        if isinstance(text, str):
+            page = page.replace("__%s__" % name.upper(), html.escape(text))
+    return page
+
+
+def make_server(reader_factory, port=80, timeout=20, host=""):
+    import http.server
+    lock = threading.Lock()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        server_version = "rfid"
+
+        def send(self, status, body, content_type, extra=()):
+            data = body.encode()
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            for header in extra:
+                self.send_header(*header)
+            self.end_headers()
+            self.wfile.write(data)
+
+        def send_json(self, status, payload):
+            self.send(status, json.dumps(payload, ensure_ascii=False), "application/json; charset=utf-8")
+
+        def with_reader(self, action):
+            if not lock.acquire(blocking=False):
+                return self.send_json(409, {"error": "the reader is busy"})
+            try:
+                reader = reader_factory()
+                try:
+                    result = action(reader)
+                finally:
+                    reader.close()
+            except NoAnswer as e:
+                return self.send_json(408, {"error": str(e)})
+            except RfidError as e:
+                return self.send_json(422, {"error": str(e)})
+            finally:
+                lock.release()
+            self.send_json(200, result)
+
+        def do_GET(self):
+            url = urllib.parse.urlsplit(self.path)
+            if url.path == "/":
+                query = urllib.parse.parse_qs(url.query).get("lang", [None])[0]
+                cookies = http.cookies.SimpleCookie(self.headers.get("Cookie", ""))
+                cookie = cookies["lang"].value if "lang" in cookies else None
+                lang = pick_language(query, cookie, self.headers.get("Accept-Language"))
+                extra = [("Set-Cookie", "lang=%s; Path=/; Max-Age=31536000; SameSite=Lax" % lang)] if query == lang else []
+                return self.send(200, render_page(lang), "text/html; charset=utf-8", extra)
+            if url.path == "/api/info":
+                return self.with_reader(reader_info)
+            self.send_json(404, {"error": "not found"})
+
+        def do_POST(self):
+            path = urllib.parse.urlsplit(self.path).path
+            if path not in ("/api/read", "/api/write"):
+                return self.send_json(404, {"error": "not found"})
+            if self.headers.get("Content-Type", "").split(";")[0].strip() != "application/json":
+                return self.send_json(415, {"error": "send JSON"})
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(min(length, 65536)) or b"{}")
+                if not isinstance(body, dict):
+                    raise ValueError
+                key = hex_key(body["key"]) if body.get("key") else None
+                block = body.get("block")
+                if block is not None and (not isinstance(block, int) or isinstance(block, bool) or block < 0):
+                    raise ValueError
+            except (ValueError, argparse.ArgumentTypeError):
+                return self.send_json(400, {"error": "bad request: the key is 12 hex digits, the block a whole number"})
+            if path == "/api/read":
+                return self.with_reader(lambda r: read_chip(r, timeout, key, block, bool(body.get("dump"))))
+            self.with_reader(lambda r: write_chip(r, body.get("kind"), body.get("value"), timeout, key, block))
+
+        def log_message(self, fmt, *args):
+            print("rfid: %s %s" % (self.address_string(), fmt % args), file=sys.stderr)
+
+    server = http.server.ThreadingHTTPServer((host, port), Handler)
+    server.daemon_threads = True
+    return server
 
 
 if __name__ == "__main__":

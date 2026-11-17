@@ -107,6 +107,72 @@ refused("145 bytes", lambda: ntag()[1].write(4, bytes(145)), "do not fit")
 refused("the lock pages", lambda: ntag()[1].write(40, bytes(4)), "not a user page")
 refused("the header pages", lambda: ntag()[1].write(2, bytes(4)), "not a user page")
 
+# The web page and its API, against the simulated chips above.
+import json, threading, urllib.request, urllib.error
+check("German has every English string", sorted(rfid.COPY["de"]), sorted(rfid.COPY["en"]))
+check("and every kind", sorted(rfid.COPY["de"]["kinds"]), sorted(rfid.COPY["en"]["kinds"]))
+check("browser asks for German", rfid.pick_language(None, None, "de-DE,de;q=0.9,en;q=0.8"), "de")
+check("weights count", rfid.pick_language(None, None, "fr, en;q=0.5, de;q=0.9"), "de")
+check("unknown languages fall back to English", rfid.pick_language(None, None, "fr-FR"), "en")
+check("the cookie beats the browser", rfid.pick_language(None, "en", "de"), "en")
+check("the link beats the cookie", rfid.pick_language("de", "en", "en"), "de")
+check("no placeholder is left on the page", "__" in rfid.render_page("de").replace("__proto__", ""), False)
+
+class Closing:
+    def close(self): pass
+    def version(self): return 0x92
+chips = {}
+gate = threading.Event(); gate.set()
+def fake_chip_on_reader(reader, timeout, key, on_wait):
+    gate.wait(5)
+    if "chip" not in chips: raise rfid.NoAnswer("no chip within %g seconds" % timeout)
+    return "01:02:03:04", chips["chip"]
+rfid.chip_on_reader = fake_chip_on_reader
+server = rfid.make_server(Closing, port=0, host="127.0.0.1")
+threading.Thread(target=server.serve_forever, daemon=True).start()
+base = "http://127.0.0.1:%d" % server.server_address[1]
+rfid.print = lambda *a, **k: None   # the access log
+def http(path, body=None, ctype="application/json", headers=()):
+    data = None if body is None else (json.dumps(body) if ctype == "application/json" else body).encode()
+    req = urllib.request.Request(base + path, data=data, headers=dict(headers, **({"Content-Type": ctype} if data else {})))
+    try:
+        with urllib.request.urlopen(req) as r: return r.status, r.read().decode(), dict(r.headers)
+    except urllib.error.HTTPError as e: return e.code, e.read().decode(), dict(e.headers)
+def api(path, body=None, **kw):
+    status, text, _ = http(path, body, **kw)
+    return status, json.loads(text)
+
+status, page, headers = http("/", headers={"Accept-Language": "de"})
+check("the page is German for a German browser", (status, '<html lang="de">' in page, "Chip lesen" in page), (200, True, True))
+status, page, headers = http("/?lang=en", headers={"Accept-Language": "de"})
+check("the switch to English is remembered", ('<html lang="en">' in page, headers.get("Set-Cookie", "").startswith("lang=en")), (True, True))
+check("info names the reader", api("/api/info"), (200, {"reader": "MFRC522 v2.0", "version": "0x92"}))
+check("no chip is 408", api("/api/read", {})[0], 408)
+r, chips["chip"] = classic()
+check("a form post is refused (no cross-site writes)", http("/api/write", "kind=text&value=x", ctype="text/plain")[0], 415)
+check("a bad key is 400", api("/api/read", {"key": "zz"})[0], 400)
+check("a negative block is 400", api("/api/read", {"block": -1})[0], 400)
+status, body = api("/api/write", {"kind": "text", "value": "Grüße an die Werkstatt"})
+check("writing text", (status, body["where"], body["bytes"]), (200, "blocks 8-9", 24))
+status, body = api("/api/read", {})
+check("reading it back", (status, body["kind"], body["value"], body["where"]), (200, "text", "Grüße an die Werkstatt", "block 8"))
+check("a URL on a Classic is 422", api("/api/write", {"kind": "url", "value": "https://example.org"})[0], 422)
+check("a missing kind is 422", api("/api/write", {"value": "x"})[0], 422)
+check("empty text clears it", (api("/api/write", {"kind": "text", "value": ""})[0], api("/api/read", {})[1]["kind"]), (200, "empty"))
+check("a dump has every block", len(api("/api/read", {"dump": True})[1]["dump"]), 64)
+r, chips["chip"] = ntag()
+status, body = api("/api/write", {"kind": "url", "value": "https://example.org"})
+check("a URL on an NTAG, with the format note", (status, body["where"], "note" in body), (200, "pages 4-8", True))
+check("reads back as a link", api("/api/read", {})[1]["value"], "https://example.org")
+gate.clear()
+slow = threading.Thread(target=lambda: api("/api/read", {})); slow.start()
+import time; time.sleep(0.3)
+check("a second request while one waits is 409", api("/api/read", {})[0], 409)
+gate.set(); slow.join()
+check("and the reader is free afterwards", api("/api/read", {})[0], 200)
+check("an unknown path is 404", api("/api/nope", {})[0], 404)
+server.shutdown()
+
 print("all ok" if not fails else "%d failed" % fails)
 sys.exit(1 if fails else 0)
 PY

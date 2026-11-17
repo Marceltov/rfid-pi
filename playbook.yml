@@ -8,6 +8,8 @@
     # The GPIO the RC522's RST pin is wired to (header pin 22). The reader
     # sleeps while it is low, so the firmware drives it high from boot.
     rfid_rst_gpio: 25
+    # The web page (rfid serve): http://<pi>:<port>/, no login, LAN only.
+    rfid_web_port: 80
   tasks:
     - name: Check that this is Raspberry Pi OS (Bookworm or Trixie)
       ansible.builtin.assert:
@@ -47,6 +49,7 @@
         src: files/rfid
         dest: /usr/local/bin/rfid
         mode: "0755"
+      notify: Restart the web page
 
     # Reads the reader's version register over SPI: fails on a miswired or
     # unpowered reader, and needs no chip.
@@ -59,3 +62,52 @@
     - name: Show the reader
       ansible.builtin.debug:
         msg: "{{ rfid_info.stdout }}"
+
+    - name: Run the web page as a service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/rfid-web.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=RFID reader web page (rfid serve)
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          ExecStart=/usr/local/bin/rfid serve --port {{ rfid_web_port }}
+          Restart=on-failure
+          RestartSec=2
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart the web page
+
+    - name: Start the web page at boot
+      ansible.builtin.systemd_service:
+        name: rfid-web
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Restart the web page now if it changed
+      ansible.builtin.meta: flush_handlers
+
+    - name: Check that the web page answers and sees the reader
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ rfid_web_port }}/api/info"
+      register: rfid_web_info
+      retries: 10
+      delay: 1
+      until: rfid_web_info.status == 200
+      check_mode: false
+
+    - name: Show where the web page is
+      ansible.builtin.debug:
+        msg: "http://{{ ansible_host }}{{ '' if rfid_web_port == 80 else ':' ~ rfid_web_port }}/"
+
+  handlers:
+    - name: Restart the web page
+      ansible.builtin.systemd_service:
+        name: rfid-web
+        state: restarted
+        daemon_reload: true
