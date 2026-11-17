@@ -6,6 +6,10 @@ needs nothing beyond Raspberry Pi OS and its `python3-spidev` package. Older
 tutorials use SPI-Py and MFRC522-python, which are Python 2 and do not run on
 current Raspberry Pi OS.
 
+The story behind this repo — and why a Raspberry Pi couldn't copy the door fob
+it was built for — is written up here:
+[**The RFID rabbit hole**](https://marcelbruckner.de/blog/the-rfid-rabbit-hole/).
+
 ![A Raspberry Pi wired to a blue RC522 reader over a ribbon cable](images/pi-rc522.jpg)
 
 ## Wiring
